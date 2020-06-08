@@ -1,0 +1,43 @@
+        IF grad = 1 THEN
+                SET grade = "CQ";
+        END IF;
+
+        IF grad = 2 THEN
+                SET grade = "DQ";
+        END IF;
+
+        IF grad = 3 THEN
+                SET grade = "DDQ";
+        END IF;
+
+        IF grad = 4 THEN
+                SET grade = "EDDQ";
+        END IF;
+
+        IF grad = 5 THEN
+                SET grade = "IF";
+        END IF;
+
+        IF grad = 6 THEN
+                SET grade = "1010";
+        END IF;
+
+        IF grad = 7 THEN
+                SET grade = "1015";
+        END IF;
+
+        IF grad = 8 THEN
+                SET grade = "1020";
+        END IF;
+
+        IF grad = 9 THEN
+                SET grade = "HS45";
+        END IF;
+
+        IF grad = 10 THEN
+                SET grade = "HS50";
+        END IF;
+
+        IF grad = 11 THEN
+                SET grade = "FE";
+        END IF;
