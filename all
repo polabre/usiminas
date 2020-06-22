@@ -1,0 +1,978 @@
+#include "stdafx.h"
+#include "modelNN.h"
+#include "occiNideaL.h"
+#include "ssopc.h"
+//-------------------------------------------------------------------------------------------------
+//-------------------------------------------------------------------------------------------------
+
+// Data Collector class - adapted for Cold Rolling Force Calculator
+class DataCollector
+{
+private:
+	bool enableUpd; // enables working thread updated
+
+	queryResults tagsMatrix; // interface tags matrix
+
+	string alias; // interface alias
+	string name; //interface name
+	string ip; // interface ip address
+	string type; //interface type
+	string port; //interface port
+	string user; //interface user
+	string password; //interface password
+
+	HANDLE threadHandle; // working thread handle
+
+	//---------------------------------------------------------------------------------------------
+	//---------------------------------------------------------------------------------------------
+
+	void SetTagsMatrix(queryResults qResMatrix)
+	{
+		tagsMatrix = qResMatrix;
+	};
+
+	//---------------------------------------------------------------------------------------------
+	//---------------------------------------------------------------------------------------------
+
+	// Thread for opc read
+	static unsigned __stdcall WorkingThread_opc_read(void* param)
+	{
+		DataCollector* dc = (DataCollector*)param;
+
+		// OPC server communications
+		//---------------------------------------------------------------------------------------------
+		_bstr_t* opcItems = new _bstr_t[dc->tagsMatrix.rows];
+
+		for(int n = 0; n < dc->tagsMatrix.rows; n++)
+		{
+			opcItems[n] = (char*)dc->tagsMatrix.GetString(n, 2).c_str();
+		}
+
+		// opc server connection
+		SSOPC_COMLib g_cl;
+		SSOPC_Server *pOpcSvr = new SSOPC_Server;
+		SSOPC_Group *pOpcGrp = pOpcSvr->InitServer(dc->name.c_str(), dc->ip.c_str());
+
+		// stores opc values returned
+		_variant_t* itemsValues = new _variant_t; // store opc values return
+
+		// tags written (force / word - indexes 18 and 19)
+		_variant_t* opcWriteValues = new _variant_t[2]; // opc write tags declaration
+		int* indexes = new int[2]; indexes[0] = 18; indexes[1] = 19; // opc write indexes
+		//---------------------------------------------------------------------------------------------
+
+		// auxiliary variables
+		//---------------------------------------------------------------------------------------------
+		// new data detection
+		bool bFirstScan = true; // first scan bit
+		string prevRolo = " "; // previous value for rolo
+		bool bNewData = false; // new data detection
+		string sRolo;
+		int prevOpcWatchdog = 0; // previous watchdog read from OPC
+
+		// counter to introduce delay
+		int iDelay = 0;
+
+		// status word data
+		unsigned int iStatus;
+		bool bStatus[32]; // status word bits
+
+		bool invalidateForce = false;
+		double force = 0.0;
+		long uiword = 0;
+
+		// neural network inputs
+		double neuralInputs[67][1];
+		queryResults inputsNN(67, 1);
+
+		// main insert query
+		string insertQuery;
+		//---------------------------------------------------------------------------------------------
+
+		if (pOpcGrp != NULL) // if group exists
+		{
+			pOpcGrp->AddItems(opcItems, dc->tagsMatrix.rows);
+
+			// thread loop
+			//-----------------------------------------------------------------------------------------
+			while(dc->enableUpd) // loop if update enabled
+			{
+				itemsValues = pOpcGrp->ReadAllItems(); // opc items reading
+				if (itemsValues[0].vt != NULL) // if first value is not null
+				{
+					insertQuery.clear();
+					insertQuery = "(";
+
+					// (loop) prepares insert query
+					//--------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+					for (int i = 0; i < dc->tagsMatrix.rows; i++)
+					{
+						if (dc->tagsMatrix.GetString(i, 0) == "rolo")
+						{
+							sRolo.clear();
+							sRolo = (string)(_bstr_t)itemsValues[i];
+
+							// new data detection
+							if (sRolo == prevRolo)
+								bNewData = false;
+							else
+								bNewData = true;
+							prevRolo = sRolo;
+
+							// gets detailed information from rolo tag
+							cout << "rolo = " << sRolo.substr(0,6) << endl;
+							insertQuery.append("'" + sRolo.substr(0,6) + "', ");
+
+							cout << "divisao = " << sRolo.substr(6,2) << endl;
+							insertQuery.append("'" + sRolo.substr(6,2) + "', ");
+						}
+						else
+						{
+							if(dc->tagsMatrix.GetString(i, 0) == "status")
+							{
+								cout << dc->tagsMatrix.GetString(i, 0) << " = " << (string)(_bstr_t)itemsValues[i] << " >>> ";
+
+								insertQuery.append("'" + (string)(_bstr_t)itemsValues[i] + "', ");
+								iStatus = stol((string)(_bstr_t)itemsValues[i]);
+
+								// breakes status words into bits
+								for (int w = 0; w < 32; w++)
+									bStatus[w] = 0 != (iStatus & (1 << w));
+
+								// prints status word bits
+								for (int w = 31; w >= 0; w--)
+									cout << bStatus[w];
+								cout << " <<<" << endl;
+							}
+
+							else
+							{
+								if ((dc->tagsMatrix.GetString(i, 0) == "nr_cil_inf") || (dc->tagsMatrix.GetString(i, 0) == "nr_cil_sup"))
+								{
+									if ((int)itemsValues[i] < 100)
+									{
+										cout << dc->tagsMatrix.GetString(i, 0) << " = LET0" << (string)(_bstr_t)itemsValues[i] << endl;
+										insertQuery.append("'LET0" + (string)(_bstr_t)itemsValues[i] + "', ");
+									}
+									else
+									{
+										cout << dc->tagsMatrix.GetString(i, 0) << " = LET" << (string)(_bstr_t)itemsValues[i] << endl;
+										insertQuery.append("'LET" + (string)(_bstr_t)itemsValues[i] + "', ");
+									}
+								}
+
+								else
+								{
+									cout << dc->tagsMatrix.GetString(i, 0) << " = " << (string)(_bstr_t)itemsValues[i] << endl;
+									insertQuery.append("'" + (string)(_bstr_t)itemsValues[i] + "', ");
+								}
+							}
+						}
+					}
+
+					// prepares insertQueryValues tail
+					insertQuery.pop_back();
+					insertQuery.pop_back();
+					insertQuery.append(");");
+					//--------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+					// inserts new data
+					//--------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+					// detects new data
+					if ((bNewData) && (!bFirstScan) && (prevOpcWatchdog != (int)itemsValues[23]))
+					{
+						iDelay = 1;
+						
+					}
+
+					// addstime delay
+					if (iDelay > 0)
+					{
+						iDelay++;
+					}
+
+					if (iDelay == 5)
+					{
+						cout << insertQuery << endl;
+
+						inputsNN = GetQueryResultsFromMySQL("CALL InsertDB_LE02" + insertQuery);
+
+						for (int i = 0; i < inputsNN.columns; i++)
+						{
+							neuralInputs[i][0] = atof((char*)inputsNN.GetString(0, i).c_str());
+						}
+
+						// adjusts the force value
+						force = myNeuralNetworkFunction(neuralInputs) * 1379.3; 
+
+						uiword = 1;
+						iDelay = 0; // reset iDelay
+					}
+
+					if (bStatus[3])
+						invalidateForce = true;
+
+					if (invalidateForce && !bStatus[3])
+					{
+						uiword = 0;
+						invalidateForce = false;
+					}
+
+					if (prevOpcWatchdog == (int)itemsValues[23])
+					{
+						uiword = 0;
+						invalidateForce = false;
+						force = -999.9;
+					}
+
+					opcWriteValues[0] = force; // sets opc force tag
+					opcWriteValues[1] = uiword; // sets opc send word tag
+					pOpcGrp->WriteItems(indexes, opcWriteValues, 2); // writes opc tags
+					//--------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+					if (prevOpcWatchdog != (int)itemsValues[23])
+						dc->threadWatchdog++; // thread watchdog
+
+					if (dc->threadWatchdog > 32767) // avoids watchdog overflow
+					{
+						dc->threadWatchdog = 0;
+					}
+
+					// updates previous watchdog from OPC
+					prevOpcWatchdog = (int)itemsValues[23];
+				}
+
+				bFirstScan = false;
+				Sleep(UPD_INTERVAL); // waits time (update scan)
+			}
+		}
+
+		delete pOpcSvr;
+		delete opcWriteValues;
+		delete indexes;
+		delete opcItems;
+		delete itemsValues;
+
+		return 0;
+	};
+
+	// Thread for oracle read - rolos
+	static unsigned __stdcall WorkingThread_oracle_rolos(void* param)
+	{
+		DataCollector* dc = (DataCollector*)param;
+
+		// mysql connection - used just for mysql main insert query
+		//-----------------------------------------------------------------------------------------------
+		MYSQL* conn;
+		conn = mysql_init (NULL);
+		mysql_real_connect (conn, HOST_NAME, USER_NAME, PASSWORD, SCHEMA, PORT_NUM, SOCKET_NAME, FLAGS);
+		//-----------------------------------------------------------------------------------------------
+
+		// query results objects
+		//---------------------------------------------------------------------------------------------
+		queryResults resUpdParam; // gets the parameters to be used into oracle query
+		queryResults oracleResults; // gets the results from oracle query
+		queryResults insertMysql; // inserts new data into mysql
+		//---------------------------------------------------------------------------------------------
+
+		// creates the object needed to oracle query
+		occiNideaL oracleQuery(dc->name, dc->ip, dc->port, dc->user, dc->password);
+
+		// auxiliary query strings
+		//---------------------------------------------------------------------------------------------
+		string sMainQuery; // oracle query string
+		string mysqlQuery; // mysql insert query
+		//---------------------------------------------------------------------------------------------
+
+		// main thread loop
+		//------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+		//while(dc->enableUpd)
+		{
+			// gets parameters to be used into oracle main query (from mysql)
+			resUpdParam = GetQueryResultsFromMySQL("Call GetUpdateParams_" + dc->tagsMatrix.GetString(0, 0) + "();");
+
+			// prepares oracle main query
+			sMainQuery = dc->tagsMatrix.GetString(0, 3);
+			sMainQuery.replace(sMainQuery.find("#"), 1, resUpdParam.GetString(0, 0));
+
+			// executes oracle main query
+			oracleQuery.SetStatement(sMainQuery);
+			oracleResults = oracleQuery.GetQueryResults();
+
+			// for eache oracle main query result, inserts new data into mysql
+			//---------------------------------------------------------------------------------------------
+			for (int i = 0; i < oracleResults.rows; i++)
+			{
+				// prepares insert query
+				mysqlQuery = "CALL Update_"+ dc->tagsMatrix.GetString(0, 0) + "(";
+
+				for (int j = 0; j < oracleResults.columns; j++)
+				{
+					mysqlQuery.append("'" + oracleResults.GetString(i, j) + "', ");
+				}
+
+				mysqlQuery.pop_back();
+				mysqlQuery.pop_back();
+				mysqlQuery.append(");");
+
+				// replaces '' with NULL
+				while (mysqlQuery.find("''") != string::npos)
+				{
+					mysqlQuery.replace(mysqlQuery.find("''"), 2, "NULL");
+				}
+
+				// inserts new data into mysql
+				mysql_query(conn, mysqlQuery.c_str());
+			}
+			//---------------------------------------------------------------------------------------------
+
+			dc->threadWatchdog++; // thread watchdog
+			if (dc->threadWatchdog > 32767) // avoid watchdog overflow
+			{
+				dc->threadWatchdog = 0;
+			}
+				
+			//Sleep(UPD_INTERVAL); // wait time (update scan)
+		}
+		//------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+		// cleans up the database connection
+		mysql_close(conn);
+
+		return 0;
+	};
+
+	// Thread for oracle read - cilindros dureza
+	static unsigned __stdcall WorkingThread_oracle_cilindros_dureza(void* param)
+	{
+		DataCollector* dc = (DataCollector*)param;
+
+		//-----------------------------------------------------------------------------------------------
+		MYSQL* conn;
+		conn = mysql_init (NULL);
+		mysql_real_connect (conn, HOST_NAME, USER_NAME, PASSWORD, SCHEMA, PORT_NUM, SOCKET_NAME, FLAGS);
+		//-----------------------------------------------------------------------------------------------
+
+		// query results objects
+		//---------------------------------------------------------------------------------------------
+		queryResults resUpdParam; // gets the parameters to be used into oracle query
+		queryResults oracleResults; // gets the results from oracle query
+		queryResults insertMysql; // inserts new data into mysql
+		//---------------------------------------------------------------------------------------------
+
+		// creates the object needed to oracle query
+		occiNideaL oracleQuery(dc->name, dc->ip, dc->port, dc->user, dc->password);
+
+		// auxiliary query strings
+		//---------------------------------------------------------------------------------------------
+		string sMainQuery; // oracle query string
+		string mysqlQuery; // mysql insert query
+		//---------------------------------------------------------------------------------------------
+
+		// main thread loop
+		//------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+		//while(dc->enableUpd)
+		{
+			// gets parameters to be used into oracle main query (from mysql)
+			resUpdParam = GetQueryResultsFromMySQL("Call GetUpdateParams_" + dc->tagsMatrix.GetString(0, 0) + "();");
+
+			// prepares oracle main query
+			sMainQuery = dc->tagsMatrix.GetString(0, 3);
+			sMainQuery.replace(sMainQuery.find("#"), 1, resUpdParam.GetString(0, 0));
+
+			// executes oracle main query
+			oracleQuery.SetStatement(sMainQuery);
+			oracleResults = oracleQuery.GetQueryResults();
+
+			// for eache oracle main query result, inserts new data into mysql
+			//---------------------------------------------------------------------------------------------
+			for (int i = 0; i < oracleResults.rows; i++)
+			{
+				// prepares insert query
+				mysqlQuery = "CALL Update_"+ dc->tagsMatrix.GetString(0, 0) + "(";
+
+				for (int j = 0; j < oracleResults.columns; j++)
+				{
+					mysqlQuery.append("'" + oracleResults.GetString(i, j) + "', ");
+				}
+
+				mysqlQuery.pop_back();
+				mysqlQuery.pop_back();
+				mysqlQuery.append(");");
+
+				// replaces '' with NULL
+				while (mysqlQuery.find("''") != string::npos)
+				{
+					mysqlQuery.replace(mysqlQuery.find("''"), 2, "NULL");
+				}
+
+				// inserts new data into mysql
+				mysql_query(conn, mysqlQuery.c_str());
+			}
+			//---------------------------------------------------------------------------------------------
+
+			dc->threadWatchdog++; // thread watchdog
+			if (dc->threadWatchdog > 32767) // avoid watchdog overflow
+			{
+				dc->threadWatchdog = 0;
+			}
+				
+			//Sleep(UPD_INTERVAL); // wait time (update scan)
+		}
+		//------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+		
+		// cleans up the database connection
+		mysql_close(conn);
+
+		return 0;
+	};
+
+	// Thread for oracle read - cilindros rugosidade
+	static unsigned __stdcall WorkingThread_oracle_cilindros_rugosidade(void* param)
+	{
+		DataCollector* dc = (DataCollector*)param;
+
+		// mysql connection - used just for mysql main insert query
+		//-----------------------------------------------------------------------------------------------
+		MYSQL* conn;
+		conn = mysql_init (NULL);
+		mysql_real_connect (conn, HOST_NAME, USER_NAME, PASSWORD, SCHEMA, PORT_NUM, SOCKET_NAME, FLAGS);
+		//-----------------------------------------------------------------------------------------------
+
+		// query results objects
+		//---------------------------------------------------------------------------------------------
+		queryResults resUpdParam; // gets the parameters to be used into oracle query
+		queryResults oracleResults; // gets the results from oracle query
+		queryResults insertMysql; // inserts new data into mysql
+		//---------------------------------------------------------------------------------------------
+
+		// creates the object needed to oracle query
+		occiNideaL oracleQuery(dc->name, dc->ip, dc->port, dc->user, dc->password);
+
+		// auxiliary query strings
+		//---------------------------------------------------------------------------------------------
+		string sMainQuery; // oracle query string
+		string mysqlQuery; // mysql insert query
+		//---------------------------------------------------------------------------------------------
+
+		// main thread loop
+		//------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+		//while(dc->enableUpd)
+		{
+			// gets parameters to be used into oracle main query (from mysql)
+			resUpdParam = GetQueryResultsFromMySQL("Call GetUpdateParams_" + dc->tagsMatrix.GetString(0, 0) + "();");
+
+			// prepares oracle main query
+			sMainQuery = dc->tagsMatrix.GetString(0, 3);
+			sMainQuery.replace(sMainQuery.find("#"), 1, resUpdParam.GetString(0, 0));
+
+			// executes oracle main query
+			oracleQuery.SetStatement(sMainQuery);
+			oracleResults = oracleQuery.GetQueryResults();
+
+			// for eache oracle main query result, inserts new data into mysql
+			//---------------------------------------------------------------------------------------------
+			for (int i = 0; i < oracleResults.rows; i++)
+			{
+				// prepares insert query
+				mysqlQuery = "CALL Update_"+ dc->tagsMatrix.GetString(0, 0) + "(";
+
+				for (int j = 0; j < oracleResults.columns; j++)
+				{
+					mysqlQuery.append("'" + oracleResults.GetString(i, j) + "', ");
+				}
+
+				mysqlQuery.pop_back();
+				mysqlQuery.pop_back();
+				mysqlQuery.append(");");
+
+				// replaces '' with NULL
+				while (mysqlQuery.find("''") != string::npos)
+				{
+					mysqlQuery.replace(mysqlQuery.find("''"), 2, "NULL");
+				}
+
+				// inserts new data into mysql
+				mysql_query(conn, mysqlQuery.c_str());
+			}
+			//---------------------------------------------------------------------------------------------
+
+			dc->threadWatchdog++; // thread watchdog
+			if (dc->threadWatchdog > 32767) // avoid watchdog overflow
+			{
+				dc->threadWatchdog = 0;
+			}
+				
+			//Sleep(UPD_INTERVAL); // wait time (update scan)
+		}
+		//------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+		// cleans up the database connection
+		mysql_close(conn);
+
+		return 0;
+	};
+
+//-------------------------------------------------------------------------------------------------
+public:
+	int threadWatchdog; // working thread watchdog (conn monitoring)
+
+	// void constructor
+	//---------------------------------------------------------------------------------------------
+	DataCollector(){};
+	//---------------------------------------------------------------------------------------------
+
+	// parametrized constructor
+	//---------------------------------------------------------------------------------------------
+	DataCollector(const string& interfaceAlias,
+					const string& interfaceName,
+					const string& interfaceIP,
+					const string& interfaceType,
+					const string& interfacePort,
+					const string& interfaceUser,
+					const string& interfacePassword)
+	{
+		threadWatchdog = 0; // watchdog ini
+		enableUpd = true; // enable update ini
+		alias = interfaceAlias; // alias copy
+		name = interfaceName; // name copy
+		ip = interfaceIP; // ip address copy
+		type = interfaceType; // type copy
+		port = interfacePort; // port copy
+		user = interfaceUser; // user copy
+		password = interfacePassword; // password copy
+	};
+	//---------------------------------------------------------------------------------------------
+
+	// destructor
+	//---------------------------------------------------------------------------------------------
+	~DataCollector()
+	{
+		enableUpd = false; // stops working thread update
+
+		WaitForSingleObject(threadHandle, INFINITE); // waits for working thread return
+		CloseHandle(threadHandle); // kills the thread
+	};
+	//---------------------------------------------------------------------------------------------
+
+	// runs data collector working thread
+	//---------------------------------------------------------------------------------------------
+	void Run(queryResults qResMatrix)
+	{
+		// sets private tags matrix
+		SetTagsMatrix(qResMatrix); 
+
+		// chooses the thread function
+		//------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+		if (type == "opc_read")
+			threadHandle = (HANDLE)_beginthreadex(0, 0, &WorkingThread_opc_read, this, 0, 0);
+
+		//if (alias == "oracle_rolos")
+		//	threadHandle = (HANDLE)_beginthreadex(0, 0, &WorkingThread_oracle_rolos, this, 0, 0);
+
+		//if (alias == "oracle_cilindros_dureza")
+		//	threadHandle = (HANDLE)_beginthreadex(0, 0, &WorkingThread_oracle_cilindros_dureza, this, 0, 0);
+
+		//if (alias == "oracle_cilindros_rugosidade")
+		//	threadHandle = (HANDLE)_beginthreadex(0, 0, &WorkingThread_oracle_cilindros_rugosidade, this, 0, 0);
+		//------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+	};
+	//---------------------------------------------------------------------------------------------
+};
+
+#include "stdafx.h"
+#include <occi.h>
+//-------------------------------------------------------------------------------------------------
+//-------------------------------------------------------------------------------------------------
+
+using namespace oracle::occi;
+using namespace std;
+
+class occiNideaL
+{
+private:
+	Environment* env;
+	Connection* conn;
+
+	string sqlStmt;
+
+//-------------------------------------------------------------------------------------------------
+public:
+
+	// default constructor
+	//---------------------------------------------------------------------------------------------
+	occiNideaL(){};
+
+	// parameterized constructor
+	//---------------------------------------------------------------------------------------------
+	occiNideaL(const string& name, const string& ip, const string& port, const string& user, const string& password)
+	{
+		// assemblies path to server (as sdb string)
+		string sdb = "//" + ip + ":" + port + "/" + name;
+
+		env = Environment::createEnvironment(Environment::DEFAULT);
+		conn = env->createConnection(user, password, sdb);
+	};
+
+	// destructor
+	//---------------------------------------------------------------------------------------------
+	~occiNideaL()
+	{
+		env->terminateConnection(conn);
+		Environment::terminateEnvironment(env);
+	};
+
+	// sets the query statement string
+	//---------------------------------------------------------------------------------------------
+	void SetStatement(const string& sStmt)
+	{
+		sqlStmt.clear();
+		sqlStmt = sStmt;
+	};
+
+	// sets the query statement string
+	//---------------------------------------------------------------------------------------------
+	queryResults GetQueryResults()
+	{
+		//-----------------------------------------------------------------------------------------
+		Statement* stmt;
+		stmt = conn->createStatement(sqlStmt);
+		ResultSet* rset = stmt->executeQuery();
+		//-----------------------------------------------------------------------------------------
+
+		// gets number of columns of ResultSet
+		vector<MetaData>* metaData  =  new vector<MetaData>(rset->getColumnListMetaData());
+		int numCols = metaData->size();
+
+		// gets number of rows of ResultSet
+		//-----------------------------------------------------------------------------------------
+		int numRows = 0;
+
+		try
+		{
+			while (rset->next())
+			{
+				numRows++;
+			}
+		}
+		catch(SQLException ex)
+		{
+			cout << "Exception thrown for GetQueryResults" << endl;
+			cout << "Error number: "<< ex.getErrorCode() << endl;
+			cout<<ex.getMessage() << endl;
+		}
+		//-----------------------------------------------------------------------------------------
+
+		// resets ResultSet
+		rset->cancel();
+		rset = stmt->executeQuery();
+
+		// prepares the function return variable
+		//-----------------------------------------------------------------------------------------
+		queryResults ret(numRows, numCols);
+
+		try
+		{
+			int i = 0;
+			while (rset->next())
+			{
+				unique_ptr<string> sVal;
+				for (int j = 0; j < numCols; j++)
+				{
+					string* sVal = new string(rset->getString(j + 1));
+
+					// replaces dot by comma
+					if (sVal->find(",") != string::npos)
+					{
+						if (sVal->find(",") == 0)
+						{
+							sVal->replace(sVal->find(","), 1, "0.");
+						}
+						else
+						{
+							sVal->replace(sVal->find(","), 1, ".");
+						}
+					}
+
+					// updates matrix to be returned
+					ret.SetString(i, j, *sVal);
+					//-----------------------------------------------------------------------------
+				}
+				i++;
+			}
+		}
+		catch(SQLException ex)
+		{
+			cout << "Exception thrown for GetQueryResults" << endl;
+			cout << "Error number: "<< ex.getErrorCode() << endl;
+			cout<<ex.getMessage() << endl;
+		}
+		//-----------------------------------------------------------------------------------------
+
+		stmt->closeResultSet(rset);
+		conn->terminateStatement(stmt);
+
+		return ret;
+	};
+}; // end of class occiNideaL
+
+#include "stdafx.h"
+#include <mysql.h>
+//-------------------------------------------------------------------------------------------------
+//-------------------------------------------------------------------------------------------------
+
+// mysql database connection parameters
+const char* HOST_NAME = "localhost"; // server host (default=localhost)
+const char* USER_NAME = "root"; // username (default=login name)
+const char* PASSWORD = "sa"; // password (default=none)
+const unsigned int PORT_NUM = 3306; // port number (use built-in value)
+const char* SOCKET_NAME = NULL; // socket name (use built-in value)
+const char* SCHEMA = "nideal"; // database name (default=none)
+const unsigned int FLAGS = CLIENT_MULTI_STATEMENTS; // connection flags
+
+// update interval (ms)
+const DWORD UPD_INTERVAL = 950;
+
+// retry time (s)
+const int RETRY_TIME = 30;
+
+// thread timeout (s)
+const int THREAD_TIMEOUT = 90;
+
+//-------------------------------------------------------------------------------------------------
+//-------------------------------------------------------------------------------------------------
+
+using namespace std;
+
+// Class to store query results in string matrix format
+class queryResults
+{
+private:
+	// string matrix using vector
+	vector<vector<string>> stringMatrix;
+
+public:
+	int rows;
+	int columns;
+
+	// default constructor
+//-------------------------------------------------------------------------------------------------
+	queryResults(): stringMatrix() {};
+//-------------------------------------------------------------------------------------------------
+
+	// parameterized constructor
+//-------------------------------------------------------------------------------------------------
+	queryResults(const int& iRows, const int& iCols)
+	{
+		Resize(iRows, iCols);
+	};
+//-------------------------------------------------------------------------------------------------
+
+	// copy constructor
+//-------------------------------------------------------------------------------------------------
+	queryResults(const queryResults &qRes)
+	{
+		rows = qRes.rows;
+		columns = qRes.columns;
+
+		stringMatrix = qRes.stringMatrix;
+	};
+//-------------------------------------------------------------------------------------------------
+
+	// matrix resizing function
+//-------------------------------------------------------------------------------------------------
+	void Resize(const int& iRows, const int& iCols)
+	{
+		stringMatrix.resize(iRows);
+		for (int i = 0; i < iRows; i++)
+		{
+			stringMatrix.at(i).resize(iCols);
+		}
+
+		rows = iRows;
+		columns = iCols;
+	}
+//-------------------------------------------------------------------------------------------------
+
+	// set matrix values function
+//-------------------------------------------------------------------------------------------------
+	void SetString(const int& iRow, const int& iCol, const string& sVal)
+	{
+		stringMatrix.at(iRow).at(iCol) = sVal;
+	}
+//-------------------------------------------------------------------------------------------------
+
+	// get matrix values function
+//-------------------------------------------------------------------------------------------------
+	string GetString(const int& iRow, const int& iCol)
+	{
+		return stringMatrix.at(iRow).at(iCol);
+	}
+//-------------------------------------------------------------------------------------------------
+}; // end of class queryResults
+
+//-------------------------------------------------------------------------------------------------
+//-------------------------------------------------------------------------------------------------
+
+// function to return OPC servers from mysql
+queryResults GetQueryResultsFromMySQL(const string& sQuery)
+{
+	// gets mysql query results
+	//-----------------------------------------------------------------------------------------------
+	MYSQL* conn;
+	MYSQL_RES* res;
+	MYSQL_ROW row;
+	conn = mysql_init (NULL);
+	mysql_real_connect (conn, HOST_NAME, USER_NAME, PASSWORD, SCHEMA, PORT_NUM, SOCKET_NAME, FLAGS);
+	mysql_query(conn, sQuery.c_str());
+	res = mysql_store_result(conn);
+	//-----------------------------------------------------------------------------------------------
+
+	int fields = mysql_num_fields(res); // gets the number of columns
+	int rows= mysql_num_rows(res);      // gets the number of rows
+
+	// prepares the function return variable
+	//-----------------------------------------------------------------------------------------------
+	queryResults ret;
+
+	if ((fields > 0) && (rows > 0))
+	{
+		ret.Resize(rows, fields);
+
+		int i = 0;
+
+		while ((row = mysql_fetch_row(res)) != NULL)
+		{
+			for(int j = 0; j < fields; j++)
+			{
+				if (row[j] != NULL)
+					ret.SetString(i, j, row[j]);
+				else
+					ret.SetString(i, j, "NULL");
+			}
+			i++;
+		}
+	}
+	else
+	{
+		printf("Query %s returned void result. \n", sQuery);
+	}
+	//-----------------------------------------------------------------------------------------------
+
+	// cleans up the database result set
+	mysql_free_result(res);
+
+	// cleans up the database connection
+	mysql_close(conn);
+
+	return ret;
+};
+
+#pragma once
+
+#include <iostream>
+#include <vector>
+
+#include <math.h>
+#include <process.h>
+#include <stdio.h>
+#include <windows.h>
+
+#include "utilities.h"
+
+#include "NideaL_ColdRollingForceCalc.h"
+//-------------------------------------------------------------------------------------------------
+//-------------------------------------------------------------------------------------------------
+
+int main(int argc, char* argv[])
+{
+	// gets interfaces from nideal (mysql)
+	queryResults interfaces = GetQueryResultsFromMySQL("Call InterfacesEnum();");
+
+	// creates datacollectors array
+	DataCollector* groups = new DataCollector[interfaces.rows];
+
+	// creates items for each group
+	for (int i = 0; i < interfaces.rows; i++)
+	{
+		// stores tags group for each interface
+		queryResults tags = GetQueryResultsFromMySQL("Call TagsEnum('" + interfaces.GetString(i, 0) + "');");;
+
+		// re-creates interface group (efective constructor)
+		groups[i].~DataCollector();
+		new(&groups[i]) DataCollector(	interfaces.GetString(i, 0), // interface alias
+										interfaces.GetString(i, 2), // interface name
+										interfaces.GetString(i, 3), // interface host ip address
+										interfaces.GetString(i, 1), // interface type
+										interfaces.GetString(i, 4), // interface host port
+										interfaces.GetString(i, 5), // interface host login user
+										interfaces.GetString(i, 6)); // interface host login password
+
+		// starts data collector thread
+		groups[i].Run(tags);
+	}
+
+	// previous watchdog initialization
+	int* previousWatchdog = new int[interfaces.rows];
+	for (int i = 0; i < interfaces.rows; i++)
+		previousWatchdog[i]= 39000; // random arbitrary value
+
+	// timeoutCounter initialization
+	int* timeoutCounter = new int[interfaces.rows];
+	for (int i = 0; i < interfaces.rows; i++)
+		timeoutCounter[i] = 0;
+
+	// infinite loop
+	while(true)
+	{
+		for (int i = 0; i < interfaces.rows; i++)
+		{
+			if (groups[i].threadWatchdog == previousWatchdog[i]) // frozen threadWatchdog test
+			{
+				if(timeoutCounter[i] < THREAD_TIMEOUT) // while counter < timeout
+					timeoutCounter[i]++; // add timeout counter
+			}
+			else
+			{
+				timeoutCounter[i] = 0; // timeout counter reset
+			}
+
+			if (timeoutCounter[i] >= THREAD_TIMEOUT) // case timeout
+			{
+				if (timeoutCounter[i] == THREAD_TIMEOUT)
+				{
+					printf("Working thread %i timeout.\n",i);
+					groups[i].~DataCollector(); // destroy object
+					printf("Object %i deleted. Thread killed.\n",i);
+				}
+
+				timeoutCounter[i]++;
+
+				if (timeoutCounter[i] >= (THREAD_TIMEOUT + RETRY_TIME)) // wait RETRY TIME
+				{
+					// stores tags group for each interface
+					queryResults tags = GetQueryResultsFromMySQL("Call TagsEnum('" + interfaces.GetString(i, 0) + "');");;
+
+					// re-creates interface group (efective constructor)
+					new(&groups[i]) DataCollector(	interfaces.GetString(i, 0), // interface alias
+													interfaces.GetString(i, 2), // interface name
+													interfaces.GetString(i, 3), // interface host ip address
+													interfaces.GetString(i, 1), // interface type
+													interfaces.GetString(i, 4), // interface host port
+													interfaces.GetString(i, 5), // interface host login user
+													interfaces.GetString(i, 6)); // interface host login password
+
+					// starts data collector thread
+					groups[i].Run(tags);
+
+					timeoutCounter[i] = 0;
+				}
+			}
+
+			previousWatchdog[i] = groups[i].threadWatchdog; // previous watchdog update
+		}
+		Sleep(1000); // wait time (update scan) (1s)
+	}
+
+	return 0;
+};
