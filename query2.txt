@@ -1,0 +1,45 @@
+SELECT REGEXP_REPLACE(HS_OC.VS_TF_CILINDRO.id_cilindro,'[[:space:]]{2,}', '') "A",
+  REGEXP_REPLACE(HS_OC.VS_TF_CILINDRO.nm_abrev_tipo_conjunto,'[[:space:]]{2,}', '') "B",
+  REGEXP_REPLACE(HS_OC.VS_TF_CILINDRO.cd_laminador,'[[:space:]]{2,}', '') "C",
+  TO_CHAR(HS_OC.VS_TF_CAMPANHA_CILINDRO.dt_colocacao_laminador,'YYYY-MM-DD HH24:MI:SS') "D",
+  TO_CHAR(HS_OC.VS_TF_CAMPANHA_CILINDRO.dt_saida_laminador,'YYYY-MM-DD HH24:MI:SS') "E",
+  TO_CHAR(HS_OC.VS_TF_REL_JATEAMENTO.dt_solicitacao,'YYYY-MM-DD HH24:MI:SS') "F",
+  TO_CHAR(HS_OC.VS_TF_USINAGEM_CILINDRO.dt_fim_usinagem,'YYYY-MM-DD HH24:MI:SS') "G",
+  HS_OC.VS_TF_REL_JATEAMENTO.me_rugosidade_lo600 "H",
+  HS_OC.VS_TF_REL_JATEAMENTO.me_rugosidade_lo300 "I",
+  HS_OC.VS_TF_REL_JATEAMENTO.me_rugosidade_pc "J",
+  HS_OC.VS_TF_REL_JATEAMENTO.me_rugosidade_lm300 "K",
+  HS_OC.VS_TF_REL_JATEAMENTO.me_rugosidade_lm600 "L",
+  REGEXP_REPLACE(HS_OC.VS_TF_REL_JATEAMENTO.ds_tipo_jateamento,'[[:space:]]{2,}', '') "M",
+  REGEXP_REPLACE(HS_OC.VS_TF_USINAGEM_CILINDRO.ds_tipo_usinagem,'[[:space:]]{2,}', '') "N"
+FROM HS_OC.VS_TF_CAMPANHA_CILINDRO
+LEFT JOIN HS_OC.VS_TF_CILINDRO
+ON HS_OC.VS_TF_CILINDRO.id_cilindro = HS_OC.VS_TF_CAMPANHA_CILINDRO.id_cilindro
+LEFT JOIN HS_OC.VS_TF_USINAGEM_CILINDRO
+ON HS_OC.VS_TF_USINAGEM_CILINDRO.id_cilindro             = HS_OC.VS_TF_CILINDRO.id_cilindro
+AND HS_OC.VS_TF_USINAGEM_CILINDRO.dt_colocacao_laminador = HS_OC.VS_TF_CAMPANHA_CILINDRO.dt_colocacao_laminador
+LEFT JOIN HS_OC.VS_TF_REL_JATEAMENTO
+ON HS_OC.VS_TF_USINAGEM_CILINDRO.dt_solicitacao = HS_OC.VS_TF_REL_JATEAMENTO.dt_solicitacao
+AND HS_OC.VS_TF_USINAGEM_CILINDRO.dt_entrada    = HS_OC.VS_TF_REL_JATEAMENTO.dt_entrada
+AND HS_OC.VS_TF_USINAGEM_CILINDRO.id_cilindro   = HS_OC.VS_TF_REL_JATEAMENTO.id_cilindro
+GROUP BY HS_OC.VS_TF_CILINDRO.id_cilindro,
+  HS_OC.VS_TF_CILINDRO.nm_abrev_tipo_conjunto,
+  HS_OC.VS_TF_CILINDRO.cd_laminador,
+  HS_OC.VS_TF_CAMPANHA_CILINDRO.dt_colocacao_laminador,
+  HS_OC.VS_TF_CAMPANHA_CILINDRO.dt_saida_laminador,
+  HS_OC.VS_TF_REL_JATEAMENTO.dt_solicitacao,
+  HS_OC.VS_TF_USINAGEM_CILINDRO.dt_fim_usinagem,
+  HS_OC.VS_TF_REL_JATEAMENTO.me_rugosidade_lo600,
+  HS_OC.VS_TF_REL_JATEAMENTO.me_rugosidade_lo300,
+  HS_OC.VS_TF_REL_JATEAMENTO.me_rugosidade_pc,
+  HS_OC.VS_TF_REL_JATEAMENTO.me_rugosidade_lm300,
+  HS_OC.VS_TF_REL_JATEAMENTO.me_rugosidade_lm600,
+  HS_OC.VS_TF_REL_JATEAMENTO.ds_tipo_jateamento,
+  HS_OC.VS_TF_USINAGEM_CILINDRO.ds_tipo_usinagem
+HAVING HS_OC.VS_TF_CILINDRO.nm_abrev_tipo_conjunto       = 'TRA'
+AND HS_OC.VS_TF_CILINDRO.cd_laminador                    = 'LE2'
+AND HS_OC.VS_TF_CAMPANHA_CILINDRO.dt_colocacao_laminador > TO_DATE('#','YYYY-MM-DD HH24:MI:SS')
+AND HS_OC.VS_TF_CAMPANHA_CILINDRO.dt_colocacao_laminador < SYSDATE
+AND HS_OC.VS_TF_REL_JATEAMENTO.me_rugosidade_lo600      IS NOT NULL
+AND HS_OC.VS_TF_REL_JATEAMENTO.me_rugosidade_lo600       > 0
+ORDER BY HS_OC.VS_TF_CAMPANHA_CILINDRO.dt_colocacao_laminador
